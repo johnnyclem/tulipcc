@@ -7,3 +7,6 @@
 [submodule "tinycc"]
 	path = tinycc
 	url = https://github.com/TinyCC/tinycc
+[submodule "neon-link"]
+	path = neon-link
+	url = git@github.com:johnnyclem/neon-link.git
