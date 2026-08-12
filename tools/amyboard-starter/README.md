@@ -6,6 +6,7 @@ A simple **macOS app** for teachers and students using [AMYboard](https://amyboa
 - Plug in USB-C → pick a **JUNO** or **DX-7** factory sound → play  
 - UI styled after the **Roland JU-06A / Juno** and classic **Yamaha DX7** panels  
 - Full factory banks: **128 JUNO** + **128 DX-7** presets  
+- **128×128 front OLED**: shows engine / bank / patch and live notes; type a classroom message to push to the panel
 
 ## What it looks like
 
@@ -73,5 +74,11 @@ Same path as the web editor / `amyboardctl`:
 - SysEx `F0 00 03 45 … F7` with AMY wire `i1K{patch}ivN Z` to load a preset  
 - Normal MIDI note on/off on channel 1 to play  
 - Optional live filter/level tweaks via short `zP` Python lines  
+- OLED updates via `zP` calling `amyboard.display` (stops any running sketch loop so it owns the panel)
 
 See `docs/amyboard/control_api.md`.
+
+### OLED notes
+
+- Plug a supported **SH1107 / SSD1327** 128×128 into the **front** Grove I2C jack (not the rear Tulip jack).  
+- On connect the app calls `amyboard.stop_sketch()` then draws status; restart the board (or `amyboard.restart_sketch()` from a REPL) to return to a saved sketch like `menu_nav`.

@@ -20,7 +20,8 @@
 | 5 | Tap voice **11** (or leave default) → **Play test** | Classic electric piano |
 | 6 | Switch to **JUNO-6** (black panel) | Red LED + BANK/PATCH pads |
 | 7 | Try Group **A**, Bank **1**, Patch **5** | “Moving Strings” |
-| 8 | Play the on-screen keys or type **A S D F G H J** | Notes as you press |
+| 8 | Play the on-screen keys or type **A S D F G H J** | Notes as you press; OLED shows note names |
+| 9 | Type a short message → **Show on OLED** | Your text appears on the front panel |
 
 ## Factory memory maps
 

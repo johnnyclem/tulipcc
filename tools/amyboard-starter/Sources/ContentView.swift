@@ -8,6 +8,7 @@ struct ContentView: View {
     @State private var dx7Address = DX7MemoryAddress.home
     @State private var showSetup = true
     @State private var keyMonitor: Any?
+    @State private var oledDraft = ""
 
     var body: some View {
         VStack(spacing: 0) {
@@ -24,6 +25,7 @@ struct ContentView: View {
                 VStack(spacing: 16) {
                     instrumentPicker
                     panel
+                    oledPanel
                     statusLine
                 }
                 .padding(16)
@@ -32,7 +34,7 @@ struct ContentView: View {
             Divider()
             keyboardBar
         }
-        .frame(minWidth: 960, minHeight: 720)
+        .frame(minWidth: 960, minHeight: 780)
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear {
             installKeyMonitor()
@@ -192,6 +194,87 @@ struct ContentView: View {
         }
     }
 
+    // MARK: - OLED (hardware + Mac preview)
+
+    private var oledPanel: some View {
+        HStack(alignment: .top, spacing: 16) {
+            // Mac-side preview of the 128×128 panel (8×16 chars).
+            VStack(alignment: .leading, spacing: 6) {
+                Text("OLED preview")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(Array(midi.oledPreviewLines.enumerated()), id: \.offset) { _, line in
+                        Text(line.isEmpty ? " " : line)
+                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                            .foregroundStyle(Color(red: 0.75, green: 0.95, blue: 0.55))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+                .padding(10)
+                .frame(width: 168, height: 148, alignment: .topLeading)
+                .background(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(Color.black)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .stroke(Color.primary.opacity(0.15), lineWidth: 1)
+                )
+                Text(midi.isConnected
+                     ? (midi.oledReady ? "Pushing to front I2C panel" : "Preparing display…")
+                     : "Connect board to drive OLED")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Hardware OLED")
+                    .font(.headline)
+                Text("Shows engine, bank, patch, and live notes on the 128×128 front-panel screen. Type a short classroom message below.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                HStack(spacing: 8) {
+                    TextField("Message for the OLED (e.g. Hello class!)", text: $oledDraft)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit { sendOLEDMessage() }
+                    Button("Show on OLED") { sendOLEDMessage() }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!midi.isConnected || oledDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    Button("Clear") {
+                        oledDraft = ""
+                        midi.setOLEDUserText("")
+                    }
+                    .disabled(!midi.isConnected)
+                }
+
+                HStack {
+                    Button("Refresh OLED") { midi.refreshOLED() }
+                        .disabled(!midi.isConnected)
+                    Spacer()
+                    if !midi.activeNotes.isEmpty {
+                        Text("Playing: " + midi.activeNotes.sorted().map(AMYboardMIDI.noteName).joined(separator: " "))
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(14)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.primary.opacity(0.04))
+        )
+    }
+
+    private func sendOLEDMessage() {
+        let t = oledDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        midi.setOLEDUserText(t)
+    }
+
     // MARK: - Keyboard
 
     private var keyboardBar: some View {
@@ -261,7 +344,7 @@ private struct SetupBanner: View {
             HStack(alignment: .top, spacing: 16) {
                 step(num: "1", title: "Plug in USB-C", body: "Data cable into AMYboard + Mac. Wait for green Connected.")
                 step(num: "2", title: "Plug in sound", body: "Headphones/speakers into the AMYboard audio OUT. Start quiet.")
-                step(num: "3", title: "Pick JUNO or DX-7", body: "Tap a bank/patch on the panel (try DX-7 voice 11 — Electric Piano). Then Play test.")
+                step(num: "3", title: "Pick JUNO or DX-7", body: "Tap a bank/patch on the panel (try DX-7 voice 11 — Electric Piano). Then Play test. The front OLED tracks engine/bank/patch + notes.")
             }
 
             if !midi.isConnected {

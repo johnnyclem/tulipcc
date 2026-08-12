@@ -5,8 +5,11 @@ import Combine
 /// Talks to a plugged-in AMYboard over USB MIDI (CoreMIDI).
 ///
 /// Control path matches docs/amyboard/control_api.md:
-///   SysEx F0 00 03 45 <ASCII payload> F7  — load patches, ping
+///   SysEx F0 00 03 45 <ASCII payload> F7  — load patches, ping, zP Python
 ///   Channel-voice note on/off on channel 1 — play the loaded synth
+///
+/// Front-panel 128×128 OLED (SH1107/SSD1327) is driven with short `zP` lines that
+/// call `amyboard.display` — same API as on-device sketches.
 @MainActor
 final class AMYboardMIDI: ObservableObject {
     @Published private(set) var isConnected = false
@@ -15,6 +18,11 @@ final class AMYboardMIDI: ObservableObject {
     @Published private(set) var lastError: String?
     @Published private(set) var loadedPreset: SoundPreset?
     @Published var activeNotes: Set<UInt8> = []
+    /// Optional classroom message shown on the bottom of the OLED.
+    @Published var oledUserText: String = ""
+    /// Last lines we pushed (for the Mac-side OLED preview).
+    @Published private(set) var oledPreviewLines: [String] = Array(repeating: "", count: 8)
+    @Published private(set) var oledReady = false
 
     private var client = MIDIClientRef()
     private var inputPort = MIDIPortRef()
@@ -22,10 +30,15 @@ final class AMYboardMIDI: ObservableObject {
     private var destEndpoint: MIDIEndpointRef = 0
     private var sourceEndpoint: MIDIEndpointRef = 0
     private var pollTimer: Timer?
+    private var oledDebounceTask: Task<Void, Never>?
+    private var oledPrepared = false
     private let channel: UInt8 = 0  // MIDI channel 1 (0-indexed)
 
     /// SPSS manufacturer ID used by AMYboard SysEx control frames.
     private let mfr: [UInt8] = [0x00, 0x03, 0x45]
+
+    /// 8×8 font → 16 columns on a 128-wide panel.
+    private let oledCols = 16
 
     init() {
         setupMIDI()
@@ -96,6 +109,11 @@ final class AMYboardMIDI: ObservableObject {
             if !wasConnected {
                 statusMessage = "Connected to \(match.name). Pick a sound!"
                 lastError = nil
+                oledPrepared = false
+                // Claim the OLED for this app (stops a running sketch loop that
+                // would otherwise overwrite the panel).
+                prepareOLED()
+                scheduleOLEDRefresh(immediate: true)
             }
             if inputPort != 0, sourceEndpoint != 0 {
                 MIDIPortConnectSource(inputPort, sourceEndpoint, nil)
@@ -112,6 +130,9 @@ final class AMYboardMIDI: ObservableObject {
             isConnected = false
             loadedPreset = nil
             activeNotes.removeAll()
+            oledPrepared = false
+            oledReady = false
+            oledPreviewLines = Array(repeating: "", count: 8)
         }
     }
 
@@ -180,6 +201,7 @@ final class AMYboardMIDI: ObservableObject {
         loadedPreset = preset
         statusMessage = "Loaded \(preset.familyLabel) — \(preset.shortName)"
         lastError = nil
+        scheduleOLEDRefresh(immediate: true)
     }
 
     func loadJuno(address: JunoMemoryAddress) {
@@ -252,12 +274,14 @@ final class AMYboardMIDI: ObservableObject {
         let vel = max(1, min(velocity, 127))
         send([0x90 | channel, note, vel])
         activeNotes.insert(note)
+        scheduleOLEDRefresh()
     }
 
     func noteOff(_ note: UInt8) {
         guard isConnected else { return }
         send([0x80 | channel, note, 0])
         activeNotes.remove(note)
+        scheduleOLEDRefresh()
     }
 
     func allNotesOff() {
@@ -267,6 +291,178 @@ final class AMYboardMIDI: ObservableObject {
             send([0x80 | channel, n, 0])
         }
         activeNotes.removeAll()
+        scheduleOLEDRefresh(immediate: true)
+    }
+
+    // MARK: - OLED (front-panel 128×128)
+
+    /// Apply user text and refresh the panel immediately.
+    func setOLEDUserText(_ text: String) {
+        oledUserText = String(text.prefix(48))
+        scheduleOLEDRefresh(immediate: true)
+    }
+
+    /// Force a redraw of engine / bank / patch / notes / user text.
+    func refreshOLED() {
+        scheduleOLEDRefresh(immediate: true)
+    }
+
+    /// Stop any sketch loop and init the I2C OLED once per connection.
+    private func prepareOLED() {
+        guard isConnected else { return }
+        // stop_sketch so menu_nav (etc.) doesn't overwrite our draws.
+        runPython("import amyboard;amyboard.stop_sketch()")
+        runPython("import amyboard;amyboard.init_display()")
+        oledPrepared = true
+        oledReady = true
+    }
+
+    private func scheduleOLEDRefresh(immediate: Bool = false) {
+        oledDebounceTask?.cancel()
+        let delay: UInt64 = immediate ? 20_000_000 : 90_000_000
+        oledDebounceTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: delay)
+            guard !Task.isCancelled else { return }
+            await pushOLEDFrame()
+        }
+    }
+
+    private func pushOLEDFrame() async {
+        guard isConnected else { return }
+        if !oledPrepared {
+            prepareOLED()
+            // Let stop_sketch / init_display finish before drawing.
+            try? await Task.sleep(nanoseconds: 120_000_000)
+            guard !Task.isCancelled else { return }
+        }
+
+        let lines = buildOLEDLines()
+        oledPreviewLines = lines
+
+        // Pack 2 rows per zP; brief pause so the board can ACK (control_api.md).
+        // Color 255 works on SH1107/SSD1327; mono panels treat non-zero as on.
+        runPython("import amyboard as A;d=A.display;d.fill(0) if (d and d.available) else None")
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        guard !Task.isCancelled else { return }
+
+        var i = 0
+        while i < lines.count {
+            let y0 = i * 12
+            let a = pyQuote(lines[i])
+            if i + 1 < lines.count {
+                let y1 = (i + 1) * 12
+                let b = pyQuote(lines[i + 1])
+                runPython("import amyboard as A;d=A.display;(d.text('\(a)',0,\(y0),255),d.text('\(b)',0,\(y1),255)) if (d and d.available) else None")
+            } else {
+                runPython("import amyboard as A;d=A.display;d.text('\(a)',0,\(y0),255) if (d and d.available) else None")
+            }
+            try? await Task.sleep(nanoseconds: 30_000_000)
+            guard !Task.isCancelled else { return }
+            i += 2
+        }
+        runPython("import amyboard as A;d=A.display;d.show() if (d and d.available) else None")
+    }
+
+    /// Layout (8 rows × 16 chars) for the 128×128 panel.
+    private func buildOLEDLines() -> [String] {
+        var lines = Array(repeating: "", count: 8)
+
+        if let p = loadedPreset {
+            lines[0] = fit("ENGINE \(p.familyLabel)")
+            lines[1] = fit("BANK  \(bankLabel(for: p))")
+            lines[2] = fit("PATCH \(p.shortName)")
+            lines[3] = fit("#\(p.id)")
+        } else {
+            lines[0] = fit("ENGINE --")
+            lines[1] = fit("BANK  --")
+            lines[2] = fit("PATCH (none)")
+            lines[3] = fit("pick a sound")
+        }
+
+        lines[4] = fit("NOTES")
+        let notes = activeNotes.sorted().map(Self.noteName).joined(separator: " ")
+        if notes.isEmpty {
+            lines[5] = fit("(none)")
+        } else {
+            // May spill to row 6 if many notes.
+            let wrapped = wrap(notes, width: oledCols, maxLines: 2)
+            lines[5] = fit(wrapped[0])
+            if wrapped.count > 1 {
+                lines[6] = fit(wrapped[1])
+            }
+        }
+
+        let msg = oledUserText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !msg.isEmpty {
+            // Prefer bottom row(s) for classroom text.
+            let msgLines = wrap(msg, width: oledCols, maxLines: 2)
+            if lines[6].isEmpty {
+                lines[6] = fit(msgLines[0])
+                if msgLines.count > 1 { lines[7] = fit(msgLines[1]) }
+            } else {
+                lines[7] = fit(msgLines[0])
+            }
+        } else if lines[7].isEmpty {
+            lines[7] = fit(isConnected ? "AMYboard" : "")
+        }
+        return lines
+    }
+
+    private func bankLabel(for preset: SoundPreset) -> String {
+        switch preset.family {
+        case .juno:
+            return JunoMemoryAddress(patchIndex: preset.id).displayCode
+        case .dx7:
+            let a = DX7MemoryAddress(patchIndex: preset.id - 128)
+            return "\(a.bankLabel)-\(a.voice)"
+        }
+    }
+
+    private func fit(_ s: String) -> String {
+        String(s.prefix(oledCols))
+    }
+
+    private func wrap(_ s: String, width: Int, maxLines: Int) -> [String] {
+        var out: [String] = []
+        var rest = s
+        while !rest.isEmpty && out.count < maxLines {
+            if rest.count <= width {
+                out.append(rest)
+                break
+            }
+            out.append(String(rest.prefix(width)))
+            rest = String(rest.dropFirst(width))
+        }
+        if out.isEmpty { out = [""] }
+        return out
+    }
+
+    static func noteName(_ note: UInt8) -> String {
+        let names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+        let n = Int(note)
+        return "\(names[n % 12])\(n / 12 - 1)"
+    }
+
+    /// Escape user/status text for a Python single-quoted string.
+    private func pyQuote(_ s: String) -> String {
+        var out = ""
+        for ch in s {
+            guard let u = ch.unicodeScalars.first else { continue }
+            let v = u.value
+            // Printable ASCII only (OLED font is 8×8 ASCII).
+            guard v >= 32 && v < 127 else { continue }
+            if ch == "'" || ch == "\\" { continue }
+            out.append(ch)
+            if out.count >= oledCols { break }
+        }
+        return out
+    }
+
+    /// Run one Python statement on the board via control SysEx `zP…Z`.
+    private func runPython(_ code: String) {
+        // Keep well under typical SysEx / board line limits.
+        let trimmed = code.count > 240 ? String(code.prefix(240)) : code
+        sendSysExPayload(Array("zP\(trimmed)Z".utf8))
     }
 
     // MARK: - Low-level MIDI
